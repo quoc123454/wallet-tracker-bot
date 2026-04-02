@@ -166,14 +166,18 @@ async def poll_loop(app: Application):
                     a for data in watched.values()
                     for a in data.get(chain_id, set())
                 )
+                print(f"[poll] {chain_id}: watching {len(all_addrs)} addrs: {all_addrs}", flush=True)
                 for addr in all_addrs:
                     tx = await get_latest_normal_tx(session, chain_id, addr)
+                    print(f"[poll] {chain_id} {addr[:8]}: tx={tx['hash'][:12] if tx else None}", flush=True)
                     if not tx:
                         continue
                     key = f"{chain_id}:{addr}"
                     txhash = tx["hash"]
                     if last_tx.get(key) == txhash:
+                        print(f"[poll] {chain_id} {addr[:8]}: no change", flush=True)
                         continue
+                    print(f"[poll] {chain_id} {addr[:8]}: NEW TX {txhash[:12]}", flush=True)
                     last_tx[key] = txhash
 
                     # Lấy token transfers trong cùng block
