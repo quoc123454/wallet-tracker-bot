@@ -1,4 +1,5 @@
 import os
+import json
 import asyncio
 import aiohttp
 from telegram import Update
@@ -6,6 +7,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "YOUR_TELEGRAM_TOKEN")
 ETHERSCAN_KEY  = os.environ.get("ETHERSCAN_KEY", "YOUR_ETHERSCAN_KEY")
+DATA_FILE      = "/tmp/watched.json"
 
 CHAINS = {
     "eth": {
@@ -13,7 +15,6 @@ CHAINS = {
         "api": "https://api.etherscan.io/api",
         "key": ETHERSCAN_KEY,
         "explorer_tx": "https://etherscan.io/tx",
-        "explorer_addr": "https://etherscan.io/address",
         "symbol": "ETH",
     },
     "base": {
@@ -21,39 +22,54 @@ CHAINS = {
         "api": "https://api.basescan.org/api",
         "key": ETHERSCAN_KEY,
         "explorer_tx": "https://basescan.org/tx",
-        "explorer_addr": "https://basescan.org/address",
         "symbol": "ETH",
     },
 }
 
-# { chat_id: { "eth": set(addresses), "base": set(addresses) } }
+# { "chat_id": { "eth": ["addr1", ...], "base": [...] } }
 watched = {}
 # { "chain:address": last_tx_hash }
 last_tx = {}
 
+def save():
+    with open(DATA_FILE, "w") as f:
+        json.dump(watched, f)
+
+def load():
+    global watched
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE) as f:
+            watched = json.load(f)
+    print(f"[boot] Loaded {sum(len(v) for d in watched.values() for v in d.values())} addresses", flush=True)
+
 async def fetch(session, url):
-    async with session.get(url) as r:
+    async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
         return await r.json()
 
-async def get_latest_normal_tx(session, chain_id, address):
+async def get_latest_tx(session, chain_id, address):
     c = CHAINS[chain_id]
-    # Lấy cả TX gửi và nhận bằng cách query không lọc địa chỉ cụ thể
     url = (f"{c['api']}?module=account&action=txlist"
            f"&address={address}&startblock=0&endblock=99999999"
-           f"&page=1&offset=5&sort=desc&apikey={c['key']}")
-    data = await fetch(session, url)
-    if data["status"] == "1" and data["result"]:
-        return data["result"][0]
+           f"&page=1&offset=1&sort=desc&apikey={c['key']}")
+    try:
+        data = await fetch(session, url)
+        if data["status"] == "1" and data["result"]:
+            return data["result"][0]
+    except Exception as e:
+        print(f"[error] get_latest_tx {chain_id} {address}: {e}", flush=True)
     return None
 
-async def get_token_transfers(session, chain_id, address, block):
+async def get_token_transfers(session, chain_id, address, block, txhash):
     c = CHAINS[chain_id]
     url = (f"{c['api']}?module=account&action=tokentx"
            f"&address={address}&startblock={block}&endblock={block}"
            f"&sort=asc&apikey={c['key']}")
-    data = await fetch(session, url)
-    if data["status"] == "1":
-        return data["result"]
+    try:
+        data = await fetch(session, url)
+        if data["status"] == "1":
+            return [t for t in data["result"] if t.get("hash", "").lower() == txhash.lower()]
+    except Exception as e:
+        print(f"[error] get_token_transfers: {e}", flush=True)
     return []
 
 def fmt_val(value, decimals):
@@ -63,49 +79,40 @@ def fmt_val(value, decimals):
     except:
         return value
 
-def classify_tx(tx, addr, token_transfers):
+def classify_tx(tx, addr, tokens):
     is_from = tx["from"].lower() == addr
     has_input = tx.get("input", "0x") not in ("0x", "")
     eth_val = int(tx.get("value", 0))
 
-    # Phân loại swap
-    if has_input and token_transfers:
-        tokens_in  = [t for t in token_transfers if t["to"].lower() == addr]
-        tokens_out = [t for t in token_transfers if t["from"].lower() == addr]
+    tokens_in  = [t for t in tokens if t["to"].lower() == addr]
+    tokens_out = [t for t in tokens if t["from"].lower() == addr]
 
-        if tokens_in and (tokens_out or eth_val > 0):
-            out_str = " + ".join(f"{fmt_val(t['value'], t['tokenDecimal'])} {t['tokenSymbol']}" for t in tokens_out)
-            if eth_val > 0 and not tokens_out:
-                out_str = f"{eth_val/1e18:.6f} ETH"
-            in_str = " + ".join(f"{fmt_val(t['value'], t['tokenDecimal'])} {t['tokenSymbol']}" for t in tokens_in)
-            return "🔄 Swap", f"{out_str} → {in_str}"
+    if tokens_in and (tokens_out or (eth_val > 0 and is_from)):
+        out = " + ".join(f"{fmt_val(t['value'], t['tokenDecimal'])} {t['tokenSymbol']}" for t in tokens_out)
+        if not out and eth_val > 0:
+            out = f"{eth_val/1e18:.6f} ETH"
+        inp = " + ".join(f"{fmt_val(t['value'], t['tokenDecimal'])} {t['tokenSymbol']}" for t in tokens_in)
+        return "🔄 Swap", f"{out} → {inp}"
 
-        if tokens_out and not tokens_in:
-            out_str = " + ".join(f"{fmt_val(t['value'], t['tokenDecimal'])} {t['tokenSymbol']}" for t in tokens_out)
-            return "📤 Gửi Token", out_str
+    if tokens_out and not tokens_in:
+        return "📤 Gửi Token", " + ".join(f"{fmt_val(t['value'], t['tokenDecimal'])} {t['tokenSymbol']}" for t in tokens_out)
 
-        if tokens_in and not tokens_out:
-            in_str = " + ".join(f"{fmt_val(t['value'], t['tokenDecimal'])} {t['tokenSymbol']}" for t in tokens_in)
-            return "📥 Nhận Token", in_str
+    if tokens_in and not tokens_out:
+        return "📥 Nhận Token", " + ".join(f"{fmt_val(t['value'], t['tokenDecimal'])} {t['tokenSymbol']}" for t in tokens_in)
 
-    # Native ETH transfer
     if eth_val > 0 and not has_input:
-        eth_str = f"{eth_val/1e18:.6f} ETH"
-        if is_from:
-            return "📤 Gửi ETH", eth_str
-        else:
-            return "📥 Nhận ETH", eth_str
+        s = f"{eth_val/1e18:.6f} ETH"
+        return ("📤 Gửi ETH", s) if is_from else ("📥 Nhận ETH", s)
 
-    # Contract interaction không rõ
     if has_input:
-        return "⚙️ Contract Call", tx.get("functionName", "").split("(")[0] or "unknown"
+        fn = tx.get("functionName", "").split("(")[0] or "unknown"
+        return "⚙️ Contract Call", fn
 
     return "❓ Giao dịch", ""
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 *Wallet Tracker — Ethereum & Base*\n\n"
-        "Lệnh:\n"
         "/watch `0xAddress` — theo dõi cả 2 mạng\n"
         "/watch `0xAddress` eth — chỉ Ethereum\n"
         "/watch `0xAddress` base — chỉ Base\n"
@@ -115,7 +122,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 async def watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id
+    cid = str(update.effective_chat.id)
     if not ctx.args:
         await update.message.reply_text("⚠️ Dùng: /watch 0xAddress [eth|base]")
         return
@@ -125,27 +132,34 @@ async def watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     chain_arg = ctx.args[1].lower() if len(ctx.args) > 1 else "all"
     chains = [chain_arg] if chain_arg in CHAINS else list(CHAINS.keys())
-    watched.setdefault(cid, {c: set() for c in CHAINS})
+
+    if cid not in watched:
+        watched[cid] = {c: [] for c in CHAINS}
     for c in chains:
-        watched[cid][c].add(addr)
+        if addr not in watched[cid][c]:
+            watched[cid][c].append(addr)
+    save()
+
     labels = " + ".join(CHAINS[c]["name"] for c in chains)
     await update.message.reply_text(
         f"✅ Đang theo dõi `{addr}`\n🌐 Mạng: {labels}", parse_mode="Markdown"
     )
 
 async def unwatch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id
+    cid = str(update.effective_chat.id)
     if not ctx.args:
         await update.message.reply_text("⚠️ Dùng: /unwatch 0xAddress")
         return
     addr = ctx.args[0].lower()
     if cid in watched:
         for c in CHAINS:
-            watched[cid][c].discard(addr)
+            if addr in watched[cid][c]:
+                watched[cid][c].remove(addr)
+        save()
     await update.message.reply_text(f"🗑️ Đã bỏ theo dõi `{addr}`", parse_mode="Markdown")
 
 async def list_wallets(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id
+    cid = str(update.effective_chat.id)
     data = watched.get(cid, {})
     lines = []
     for c, addrs in data.items():
@@ -162,30 +176,23 @@ async def poll_loop(app: Application):
     async with aiohttp.ClientSession() as session:
         while True:
             for chain_id, chain in CHAINS.items():
-                all_addrs = set(
+                all_addrs = list({
                     a for data in watched.values()
-                    for a in data.get(chain_id, set())
-                )
-                print(f"[poll] {chain_id}: watching {len(all_addrs)} addrs: {all_addrs}", flush=True)
+                    for a in data.get(chain_id, [])
+                })
+                print(f"[poll] {chain_id}: {len(all_addrs)} addrs", flush=True)
                 for addr in all_addrs:
-                    tx = await get_latest_normal_tx(session, chain_id, addr)
-                    print(f"[poll] {chain_id} {addr[:8]}: tx={tx['hash'][:12] if tx else None}", flush=True)
+                    tx = await get_latest_tx(session, chain_id, addr)
                     if not tx:
                         continue
                     key = f"{chain_id}:{addr}"
                     txhash = tx["hash"]
                     if last_tx.get(key) == txhash:
-                        print(f"[poll] {chain_id} {addr[:8]}: no change", flush=True)
                         continue
-                    print(f"[poll] {chain_id} {addr[:8]}: NEW TX {txhash[:12]}", flush=True)
                     last_tx[key] = txhash
 
-                    # Lấy token transfers trong cùng block
-                    token_transfers = await get_token_transfers(session, chain_id, addr, tx["blockNumber"])
-                    # Chỉ lấy transfers liên quan đến tx này
-                    token_transfers = [t for t in token_transfers if t.get("hash", "").lower() == txhash.lower()]
-
-                    kind, detail = classify_tx(tx, addr, token_transfers)
+                    tokens = await get_token_transfers(session, chain_id, addr, tx["blockNumber"], txhash)
+                    kind, detail = classify_tx(tx, addr, tokens)
                     short = f"`{addr[:6]}...{addr[-4:]}`"
 
                     msg = (
@@ -194,22 +201,25 @@ async def poll_loop(app: Application):
                         f"├ {detail}\n"
                         f"└ [Xem TX]({chain['explorer_tx']}/{txhash})"
                     )
-
                     for cid, data in watched.items():
-                        if addr in data.get(chain_id, set()):
-                            await app.bot.send_message(cid, msg, parse_mode="Markdown")
+                        if addr in data.get(chain_id, []):
+                            try:
+                                await app.bot.send_message(int(cid), msg, parse_mode="Markdown")
+                            except Exception as e:
+                                print(f"[error] send_message: {e}", flush=True)
 
             await asyncio.sleep(30)
 
+async def post_init(app: Application):
+    load()
+    asyncio.create_task(poll_loop(app))
+
 def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("watch", watch))
     app.add_handler(CommandHandler("unwatch", unwatch))
     app.add_handler(CommandHandler("list", list_wallets))
-
-    loop = asyncio.get_event_loop()
-    loop.create_task(poll_loop(app))
     app.run_polling()
 
 if __name__ == "__main__":
